@@ -1,0 +1,96 @@
+from contextlib import contextmanager
+from datetime import datetime
+
+import pandas as pd
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from snowflake.snowpark import Session
+
+from SecretManager import get_secret
+from configurations import Config
+
+class ReadSnowflake:
+    def __init__(self):
+        config = Config()
+        self.config = config
+        self.connection_parameters = config.params
+        self.session = None
+        # EMEA or NA
+
+    def _load_credentials(self):
+        secret = get_secret(self.config.SECRET_NAME, self.config.aws_region)
+        _private_key = serialization.load_pem_private_key(
+            secret.encode(),
+            password=None,
+            backend=default_backend()
+        )
+        private_key_bytes = _private_key.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        self.connection_parameters['private_key'] = private_key_bytes
+
+    def _build_session(self):
+        try:
+            self._load_credentials()
+            self.session = Session.builder.configs(self.connection_parameters).create()
+        except Exception as e:
+            raise RuntimeError(f"Failed to create Snowflake session: {e}")
+
+    @contextmanager
+    def _managed_session(self):
+        """
+        Context manager for Snowflake session.
+        """
+        try:
+            self._build_session()
+            yield self.session
+        finally:
+            self.session.close()
+
+    def _execute_query(self, sql):
+        """
+        Execute a SQL query and return the result as a pandas DataFrame.
+        """
+        try:
+            with self._managed_session() as session:
+                snowpark_df = session.sql(sql).to_pandas()
+                return snowpark_df
+        except Exception as e:
+            raise RuntimeError(f"Failed to execute query: {e}")
+
+    def _check_if_data_already_uploaded(self,table,column,value):
+          '''Query to check if forecast date exists so we dont upload data twice'''
+
+          sql = f"""SELECT CASE WHEN EXISTS \
+                  (SELECT 1 FROM {table}\
+                  WHERE {column} = '{value}') THEN 1 ELSE 0 END AS ValueExists;"""
+
+          df = self._execute_query(sql)
+
+          exists = int(df.iloc[0].values) == 1
+
+          return exists
+
+    def pandas_to_sf(self,pandas_df,table_name,database = 'DEV_LS_DIBT',schema = 'CHANNEL_DATA_FORECASTING',overwrite=False,column='timestamp'):
+    
+        if not overwrite:
+            table = f'{database}.{schema}.{table_name}'
+            print(table)
+            value = str(pandas_df[column].iloc[0])
+            print(value)
+            exists = self._check_if_data_already_uploaded(table,column,value)
+            if exists:
+                raise ValueError(f"{table} already contains column {column} with value {value}")
+
+        with self._managed_session() as session:
+
+              snowpark_df = self.session.write_pandas(
+              pandas_df,
+              table_name=table_name,
+              database = database,
+              schema = schema,
+              auto_create_table=True,
+              overwrite=overwrite
+         )
